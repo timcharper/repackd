@@ -1,0 +1,27 @@
+[Unit]
+Description=repackd on-demand deb->rpm repo
+Requires=repackd.socket
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/repackd serve
+DynamicUser=yes
+StateDirectory=repackd
+StateDirectoryMode=0755
+Environment=HOME=/var/lib/repackd
+Environment=GNUPGHOME=/var/lib/repackd/gnupg
+Environment=REPACKD_IDLE_SECONDS=60
+# a build can take minutes; never kill it mid-request
+TimeoutStopSec=15min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0022

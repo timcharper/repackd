@@ -1,0 +1,32 @@
+# Claude Desktop for Linux: Anthropic's signed apt repo, repackaged as an RPM.
+name    = "claude-desktop"
+summary = "Claude Desktop (local repack of Anthropic's official .deb)"
+license = "Proprietary"
+url     = "https://code.claude.com/docs/en/desktop-linux"
+
+[apt]
+url       = "https://downloads.claude.ai/claude-desktop/apt/stable"
+suite     = "stable"
+component = "main"
+package   = "claude-desktop"
+key_url   = "https://downloads.claude.ai/claude-desktop/key.asc"
+# Dearmored copy lives in /etc/repackd/keys (install.sh puts it there).
+keyring   = "claude-desktop.gpg"
+# Optional: fill in a fingerprint you verified out-of-band; install.sh then
+# refuses a key that doesn't match instead of trusting on first use.
+key_fingerprint = ""
+
+[build]
+# Debian/Ubuntu-only files that mean nothing on Fedora.
+strip        = ["etc/apt", "etc/apparmor.d", "usr/share/keyrings"]
+setuid       = ["usr/lib/claude-desktop/chrome-sandbox"]
+# Bundled Electron libs: not exported as Provides, not required from the system.
+bundled_dir  = "usr/lib/claude-desktop"
+# Cowork (agent VM) wants KVM/QEMU; deb lists it as Recommends.
+recommends   = ["qemu-kvm"]
+# Extra regex alternatives for __requires_exclude, if autoreq misfires.
+exclude_requires = []
+# warn: log + save a diff when postinst/preinst/prerm/postrm change. block: refuse the update.
+control_change = "warn"
+# Newest RPMs kept for rollback; older ones are deleted on every build.
+keep = 3

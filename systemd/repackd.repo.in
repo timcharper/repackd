@@ -1,0 +1,11 @@
+[repackd-@NAME@]
+name=@SUMMARY@
+baseurl=http://127.0.0.1:@PORT@/@NAME@/
+enabled=1
+gpgcheck=1
+gpgkey=file:///var/lib/repackd/RPM-GPG-KEY-repackd
+repo_gpgcheck=0
+metadata_expire=1h
+skip_if_unavailable=True
+# the first refresh after an upstream release blocks while the .deb is repacked
+timeout=900

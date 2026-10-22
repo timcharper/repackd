@@ -1,0 +1,778 @@
+#!/usr/bin/python3
+"""repackd: on-demand apt -> dnf repo shim.
+
+Serves a localhost dnf repo per recipe. When dnf asks for
+<recipe>/repodata/repomd.xml, the upstream signed apt repo is checked, and if
+the package version changed the .deb is verified, repackaged into an RPM,
+signed with a local key and added to the repo. Everything else is static.
+"""
+import argparse
+import difflib
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+log = logging.getLogger("repackd")
+
+ARCH_MAP = {"x86_64": "amd64", "aarch64": "arm64"}
+SCRIPTS = ("preinst", "postinst", "prerm", "postrm")
+MAX_INDEX = 256 << 20
+MAX_DEB = 4 << 30
+KEY_NAME = "RPM-GPG-KEY-repackd"
+SIGN_UID = "repackd local signing key <repackd@localhost>"
+
+SPEC = """\
+%global debug_package %{nil}
+%global __strip /bin/true
+%define _build_id_links none
+%define _binary_payload w6.zstdio
+%global __os_install_post %{nil}
+%global __brp_check_rpaths %{nil}
+%undefine __brp_mangle_shebangs
+%global _missing_build_ids_terminate_build 0
+%global __provides_exclude_from ^@BUNDLED@/.*$
+@REQ_EXCLUDE@
+
+Name:           @NAME@
+@EPOCH@Version:        @VERSION@
+Release:        @RELEASE@
+Summary:        @SUMMARY@
+License:        @LICENSE@
+URL:            @URL@
+@DEPS@
+
+%description
+@SUMMARY@
+
+Repackaged locally by repackd from the upstream .deb. Not built from source.
+
+%prep
+
+%build
+
+%install
+cp -a @TREE@/. %{buildroot}/
+
+%files
+%defattr(-,root,root,-)
+@FILES@
+"""
+
+
+class SyncError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def run(cmd, **kw):
+    kw.setdefault("check", True)
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    try:
+        return subprocess.run(cmd, **kw)
+    except subprocess.CalledProcessError as e:
+        raise SyncError(f"{cmd[0]} failed ({e.returncode}): {(e.stderr or e.stdout or '').strip()[-2000:]}")
+    except FileNotFoundError:
+        raise SyncError(f"required tool not found: {cmd[0]}")
+
+
+def fetch(url, dest, limit, want_sha=None, want_size=None):
+    h = hashlib.sha256()
+    n = 0
+    req = urllib.request.Request(url, headers={"User-Agent": "repackd"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+            while chunk := r.read(1 << 20):
+                n += len(chunk)
+                if n > limit:
+                    raise SyncError(f"{url}: larger than {limit} bytes")
+                h.update(chunk)
+                f.write(chunk)
+    except OSError as e:
+        raise SyncError(f"fetch {url}: {e}")
+    if want_size is not None and n != want_size:
+        raise SyncError(f"{url}: size {n} != signed size {want_size}")
+    if want_sha and h.hexdigest() != want_sha.lower():
+        raise SyncError(f"{url}: sha256 {h.hexdigest()} != signed {want_sha}")
+
+
+def deb_ver_cmp(a, b):
+    """Debian version comparison (dpkg algorithm). Returns -1/0/1."""
+    def split(v):
+        epoch, _, rest = v.rpartition(":")
+        up, _, rev = rest.rpartition("-") if "-" in rest else (rest, "", "")
+        return int(epoch or 0), up, rev
+
+    def order(c):
+        if c == "~":
+            return -1
+        if c.isdigit():
+            return 0
+        if c.isalpha():
+            return ord(c)
+        return ord(c) + 256
+
+    def part(x, y):
+        while x or y:
+            while (x and not x[0].isdigit()) or (y and not y[0].isdigit()):
+                ox = order(x[0]) if x and not x[0].isdigit() else 0
+                oy = order(y[0]) if y and not y[0].isdigit() else 0
+                if ox != oy:
+                    return -1 if ox < oy else 1
+                x = x[1:] if x and not x[0].isdigit() else x
+                y = y[1:] if y and not y[0].isdigit() else y
+            mx = re.match(r"\d*", x).group()
+            my = re.match(r"\d*", y).group()
+            x, y = x[len(mx):], y[len(my):]
+            if int(mx or 0) != int(my or 0):
+                return -1 if int(mx or 0) < int(my or 0) else 1
+        return 0
+
+    ea, ua, ra = split(a)
+    eb, ub, rb = split(b)
+    if ea != eb:
+        return -1 if ea < eb else 1
+    return part(ua, ub) or part(ra, rb)
+
+
+def split_deb_version(v):
+    """deb [epoch:]upstream[-rev] -> (epoch|None, version, release)."""
+    epoch = None
+    if ":" in v:
+        e, v = v.split(":", 1)
+        epoch = int(e)
+    up, rev = (v.rsplit("-", 1) + [""])[:2] if "-" in v else (v, "")
+    clean = lambda s: re.sub(r"[^A-Za-z0-9._+~^]", "_", s)
+    return epoch, clean(up), (clean(rev) or "1") + ".repackd"
+
+
+def parse_stanzas(text):
+    for block in re.split(r"\n\s*\n", text.strip()):
+        d, last = {}, None
+        for line in block.splitlines():
+            if line[:1] in " \t" and last:
+                d[last] += "\n" + line.strip()
+            elif ":" in line:
+                last, _, val = line.partition(":")
+                d[last] = val.strip()
+        if d:
+            yield d
+
+
+def elf_soname(path):
+    """DT_SONAME of an ELF shared object, or None."""
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(64)
+            if hdr[:4] != b"\x7fELF":
+                return None
+            is64 = hdr[4] == 2
+            end = "<" if hdr[5] == 1 else ">"
+            if is64:
+                shoff, = struct.unpack(end + "Q", hdr[0x28:0x30])
+                shentsize, shnum = struct.unpack(end + "HH", hdr[0x3A:0x3E])
+            else:
+                shoff, = struct.unpack(end + "I", hdr[0x20:0x24])
+                shentsize, shnum = struct.unpack(end + "HH", hdr[0x2E:0x32])
+            f.seek(shoff)
+            sh = f.read(shentsize * shnum)
+            secs = []
+            for i in range(shnum):
+                b = sh[i * shentsize:(i + 1) * shentsize]
+                if is64:
+                    typ, = struct.unpack(end + "I", b[4:8])
+                    off, size = struct.unpack(end + "QQ", b[0x18:0x28])
+                    link, = struct.unpack(end + "I", b[0x28:0x2C])
+                else:
+                    typ, = struct.unpack(end + "I", b[4:8])
+                    off, size = struct.unpack(end + "II", b[0x10:0x18])
+                    link, = struct.unpack(end + "I", b[0x18:0x1C])
+                secs.append((typ, off, size, link))
+            for typ, off, size, link in secs:
+                if typ != 6:  # SHT_DYNAMIC
+                    continue
+                f.seek(off)
+                dyn = f.read(size)
+                step = 16 if is64 else 8
+                fmt = end + ("qQ" if is64 else "iI")
+                for j in range(0, len(dyn) - step + 1, step):
+                    tag, val = struct.unpack(fmt, dyn[j:j + step])
+                    if tag == 14:  # DT_SONAME
+                        _, stroff, _, _ = secs[link]
+                        f.seek(stroff + val)
+                        return f.read(512).split(b"\0", 1)[0].decode()
+    except (OSError, struct.error, IndexError):
+        pass
+    return None
+
+
+def extract_tar(src, dst):
+    """Extract a (possibly zstd) tar without the tar binary.
+
+    GNU tar 1.35 needs openat2(), which systemd's seccomp filter answers with
+    ENOSYS inside DynamicUser services. Python's 'tar' extraction filter also
+    refuses members that land outside dst, including via symlinks.
+    """
+    if src.suffix == ".zst":
+        p = subprocess.Popen(["zstd", "-dc", str(src)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=p.stdout, mode="r|") as t:
+                t.extractall(dst, filter="tar")
+        except tarfile.TarError as e:
+            raise SyncError(f"extract {src.name}: {e}")
+        finally:
+            p.stdout.close()
+        if p.wait() != 0:
+            raise SyncError(f"zstd failed: {p.stderr.read().decode()[-500:]}")
+        return
+    try:
+        with tarfile.open(src, mode="r:*") as t:
+            t.extractall(dst, filter="tar")
+    except (tarfile.TarError, OSError) as e:
+        raise SyncError(f"extract {src.name}: {e}")
+
+
+def spec_path(p):
+    """Escape a path for an rpm %files line."""
+    p = p.replace("%", "%%")
+    if re.search(r"\s", p):
+        return f'"{p}"'  # quoted names are not glob-expanded
+    return re.sub(r"([*?\[\]\\])", r"\\\1", p)
+
+
+# ---------------------------------------------------------------- recipe
+
+class Recipe:
+    def __init__(self, path, keys_dir):
+        d = tomllib.loads(Path(path).read_text())
+        self.name = d["name"]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.name):
+            raise ValueError(f"{path}: bad recipe name {self.name!r}")
+        self.summary = d.get("summary", self.name)
+        self.license = d.get("license", "Proprietary")
+        self.url = d.get("url", "")
+        apt = d["apt"]
+        self.apt_url = apt["url"].rstrip("/")
+        self.suite = apt.get("suite", "stable")
+        self.component = apt.get("component", "main")
+        self.package = apt["package"]
+        self.keyring = Path(keys_dir) / apt["keyring"]
+        b = d.get("build", {})
+        self.strip = [s.strip("/") for s in b.get("strip", [])]
+        self.setuid = [s.strip("/") for s in b.get("setuid", [])]
+        self.bundled = b.get("bundled_dir", "").strip("/")
+        self.owned_dirs = [s.strip("/") for s in b.get("owned_dirs", [self.bundled] if self.bundled else [])]
+        self.requires = b.get("requires", [])
+        self.recommends = b.get("recommends", [])
+        self.suggests = b.get("suggests", [])
+        self.exclude_requires = b.get("exclude_requires", [])  # extra regex alternatives
+        self.control_change = os.environ.get("REPACKD_CONTROL_CHANGE", b.get("control_change", "warn"))
+        if self.control_change not in ("warn", "block"):
+            raise ValueError("control_change must be warn or block")
+        self.keep = int(b.get("keep", 3))
+
+
+# ---------------------------------------------------------------- syncer
+
+class Syncer:
+    def __init__(self, recipe, state, check_minutes):
+        self.r = recipe
+        self.root = Path(state) / recipe.name
+        self.repo = self.root / "repo"
+        self.statef = self.root / "state.json"
+        self.checked = self.root / "last_check"
+        self.gnupg = Path(state) / "gnupg"
+        self.check_secs = check_minutes * 60
+        self.lock = threading.Lock()
+        self.last_fail = 0.0
+        self.arch = os.uname().machine
+        if self.arch not in ARCH_MAP:
+            raise SyncError(f"unsupported architecture {self.arch}")
+        self.repo.mkdir(parents=True, exist_ok=True)
+        self.cleanup_stale()
+
+    def cleanup_stale(self):
+        shutil.rmtree(self.root / "work", ignore_errors=True)
+
+    def state(self):
+        try:
+            return json.loads(self.statef.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, st):
+        tmp = self.statef.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st, indent=1))
+        tmp.replace(self.statef)
+
+    def fresh(self):
+        try:
+            age = time.time() - self.checked.stat().st_mtime
+        except OSError:
+            return False
+        return age < self.check_secs
+
+    def refresh(self, force=False):
+        """Sync if due. Never raises: a failed sync keeps the stale repo."""
+        with self.lock:
+            if not force and (self.fresh() or time.time() - self.last_fail < 60):
+                return
+            try:
+                self.sync()
+                self.checked.touch()
+            except Exception as e:  # noqa: BLE001 - serve stale on any failure
+                self.last_fail = time.time()
+                log.error("%s: sync failed, serving existing repo: %s", self.r.name, e)
+
+    # -- pipeline
+    def sync(self):
+        r = self.r
+        work = self.root / "work"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        try:
+            ent = self.latest_entry(work)
+            st = self.state()
+            ver = ent["Version"]
+            if st.get("built_version") == ver and any(self.repo.glob("*.rpm")):
+                log.info("%s: %s up to date", r.name, ver)
+                return
+            if st.get("blocked_version") == ver and st.get("approved_version") != ver:
+                log.warning("%s: %s blocked by maintainer-script change; run `repackd approve %s`",
+                            r.name, ver, r.name)
+                return
+            log.info("%s: building %s (was %s)", r.name, ver, st.get("built_version"))
+            deb = work / "pkg.deb"
+            fetch(f"{r.apt_url}/{ent['Filename']}", deb, MAX_DEB, ent["SHA256"], int(ent["Size"]))
+            tree, ctl = work / "tree", work / "control"
+            self.unpack(deb, tree, ctl)
+            self.guard_control(ctl, ver, st)  # may raise to block
+            rpm = self.build_rpm(work, tree, ver)
+            self.sign(rpm)
+            shutil.copy(rpm, self.repo / rpm.name)  # fresh mtime orders pruning
+            self.prune()
+            run(["createrepo_c", "--update", "--no-database", "--retain-old-md", "0", str(self.repo)])
+            st = self.state()
+            st.update(built_version=ver)
+            st.pop("blocked_version", None)
+            self.save_state(st)
+            log.info("%s: published %s", r.name, rpm.name)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def verify_release(self, work):
+        r = self.r
+        ir = work / "InRelease"
+        fetch(f"{r.apt_url}/dists/{r.suite}/InRelease", ir, MAX_INDEX)
+        if not r.keyring.is_file():
+            raise SyncError(f"pinned key missing: {r.keyring}")
+        out = work / "Release"
+        p = run(["gpgv", "--keyring", str(r.keyring), "--output", str(out), str(ir)], check=False)
+        if p.returncode != 0:
+            raise SyncError(f"InRelease signature rejected: {p.stderr.strip()[-500:]}")
+        return out.read_text()
+
+    def latest_entry(self, work):
+        r = self.r
+        rel = self.verify_release(work)
+        arch = ARCH_MAP[self.arch]
+        wanted = f"{r.component}/binary-{arch}/Packages"
+        files = {}
+        sect = None
+        for line in rel.splitlines():
+            if line and not line[0].isspace():
+                sect = line.split(":")[0]
+            elif sect == "SHA256":
+                parts = line.split()
+                if len(parts) == 3:
+                    files[parts[2]] = (parts[0], int(parts[1]))
+        for suffix, opener in ((".xz", "xz"), (".gz", "gzip"), ("", None)):
+            if wanted + suffix in files:
+                sha, size = files[wanted + suffix]
+                break
+        else:
+            raise SyncError(f"{wanted} not listed in signed Release")
+        raw = work / "Packages.dl"
+        fetch(f"{r.apt_url}/dists/{r.suite}/{wanted}{suffix}", raw, MAX_INDEX, sha, size)
+        if opener:
+            text = run([opener, "-dc", str(raw)], text=False).stdout.decode()
+        else:
+            text = raw.read_text()
+        best = None
+        for e in parse_stanzas(text):
+            if e.get("Package") == r.package and e.get("Architecture") in (arch, "all"):
+                if best is None or deb_ver_cmp(e["Version"], best["Version"]) > 0:
+                    best = e
+        if not best:
+            raise SyncError(f"{r.package} not in {wanted}")
+        fn = best["Filename"]
+        if fn.startswith("/") or ".." in Path(fn).parts:
+            raise SyncError(f"unsafe Filename {fn!r}")
+        for k in ("SHA256", "Size", "Version"):
+            if k not in best:
+                raise SyncError(f"Packages entry lacks {k}")
+        return best
+
+    def unpack(self, deb, tree, ctl):
+        d = deb.parent / "ar"
+        d.mkdir()
+        run(["ar", "x", str(deb)], cwd=d)
+        data = next(iter(sorted(d.glob("data.tar*"))), None)
+        control = next(iter(sorted(d.glob("control.tar*"))), None)
+        if not data or not control:
+            raise SyncError("deb lacks data.tar or control.tar")
+        for src, dst in ((data, tree), (control, ctl)):
+            dst.mkdir()
+            extract_tar(src, dst)
+        for s in self.r.strip:
+            shutil.rmtree(tree / s, ignore_errors=True)
+            if (tree / s).is_symlink() or (tree / s).is_file():
+                (tree / s).unlink()
+        # normalise: owner can always read, nobody else can write
+        for root, dirs, files in os.walk(tree):
+            for n in dirs + files:
+                p = os.path.join(root, n)
+                if not os.path.islink(p):
+                    m = os.stat(p).st_mode
+                    os.chmod(p, (m | 0o600 | (0o100 if os.path.isdir(p) else 0)) & ~0o022 & 0o7777)
+        shutil.rmtree(d)
+
+    def guard_control(self, ctl, ver, st):
+        hashes, texts = {}, {}
+        for s in SCRIPTS:
+            p = ctl / s
+            if p.is_file():
+                texts[s] = p.read_text(errors="replace")
+                hashes[s] = hashlib.sha256(p.read_bytes()).hexdigest()
+        base = st.get("control_hashes")
+        if base is None:
+            st["control_hashes"] = hashes
+            self.save_baseline(texts)
+            self.save_state(st)
+            return
+        if hashes == base or st.get("approved_version") == ver:
+            if hashes != base:
+                st["control_hashes"] = hashes
+                self.save_state(st)
+                self.save_baseline(texts)
+            return
+        old = self.load_baseline()
+        diff = []
+        for s in SCRIPTS:
+            diff += difflib.unified_diff(old.get(s, "").splitlines(True), texts.get(s, "").splitlines(True),
+                                         f"old/{s}", f"new/{s}")
+        dd = self.root / "diffs"
+        dd.mkdir(exist_ok=True)
+        (dd / f"control-{ver.replace('/', '_')}.diff").write_text("".join(diff) or "(hash change only)\n")
+        for old_diff in sorted(dd.glob("control-*.diff"), key=lambda p: p.stat().st_mtime)[:-5]:
+            old_diff.unlink()
+        changed = [s for s in SCRIPTS if hashes.get(s) != base.get(s)]
+        log.warning("%s: maintainer scripts changed in %s (%s); diff in %s",
+                    self.r.name, ver, ", ".join(changed), dd)
+        if self.r.control_change == "block":
+            st["blocked_version"] = ver
+            self.save_state(st)
+            raise SyncError(f"{ver} blocked (control_change=block); review diff, then `repackd approve {self.r.name}`")
+        st["control_hashes"] = hashes
+        self.save_state(st)
+        self.save_baseline(texts)
+
+    def save_baseline(self, texts):
+        b = self.root / "baseline"
+        shutil.rmtree(b, ignore_errors=True)
+        b.mkdir()
+        for s, t in texts.items():
+            (b / s).write_text(t)
+
+    def load_baseline(self):
+        b = self.root / "baseline"
+        return {s: (b / s).read_text() for s in SCRIPTS if (b / s).is_file()}
+
+    def build_rpm(self, work, tree, ver):
+        r = self.r
+        epoch, rpmver, rel = split_deb_version(ver)
+        bundled_abs = "/" + r.bundled if r.bundled else "/nonexistent"
+        # sonames of every bundled .so, so autoreq doesn't require them from the system
+        sonames = set(r.exclude_requires)
+        if r.bundled and (tree / r.bundled).is_dir():
+            for p in (tree / r.bundled).rglob("*"):
+                if p.is_file() and not p.is_symlink() and re.search(r"\.so(\.\d+)*$", p.name):
+                    sonames.add(p.name)
+                    so = elf_soname(p)
+                    if so:
+                        sonames.add(so)
+        req_ex = ""
+        if sonames:
+            # rpm macro expansion eats backslashes, so use bracket classes, not \. and \(
+            alts = [re.sub(r"[.+*?^$|(){}\[\]\\]", lambda m: f"[{m.group()}]", n) for n in sorted(sonames)]
+            req_ex = "%global __requires_exclude ^(" + "|".join(alts).replace("%", "%%") + ")([(]|$)"
+        # %files: own configured dirs, list files everywhere else
+        lines, setuid = [], set(r.setuid)
+        for root, dirs, files in os.walk(tree):
+            rel_root = os.path.relpath(root, tree)
+            rel_root = "" if rel_root == "." else rel_root
+            for n in sorted(dirs + files):
+                rp = f"{rel_root}/{n}".lstrip("/")
+                full = tree / rp
+                is_dir = full.is_dir() and not full.is_symlink()
+                if is_dir:
+                    if any(rp == o or rp.startswith(o + "/") for o in r.owned_dirs):
+                        lines.append("%dir " + spec_path("/" + rp))
+                    continue
+                path = spec_path("/" + rp)
+                if rp in setuid:
+                    lines.append(f"%attr(4755,root,root) {path}")
+                elif rp.startswith("etc/"):
+                    lines.append(f"%config(noreplace) {path}")
+                else:
+                    lines.append(path)
+        deps = [f"Requires:       {x}" for x in r.requires]
+        deps += [f"Recommends:     {x}" for x in r.recommends]
+        deps += [f"Suggests:       {x}" for x in r.suggests]
+        spec = SPEC
+        for k, v in {
+            "@BUNDLED@": bundled_abs, "@REQ_EXCLUDE@": req_ex, "@NAME@": r.package,
+            "@EPOCH@": f"Epoch:          {epoch}\n" if epoch else "", "@VERSION@": rpmver,
+            "@RELEASE@": rel, "@SUMMARY@": r.summary, "@LICENSE@": r.license, "@URL@": r.url or "https://localhost/",
+            "@DEPS@": "\n".join(deps), "@TREE@": str(tree), "@FILES@": "\n".join(lines),
+        }.items():
+            spec = spec.replace(k, v)
+        top = work / "rpmbuild"
+        sp = work / f"{r.package}.spec"
+        sp.write_text(spec)
+        run(["rpmbuild", "-bb", "--quiet", "--define", f"_topdir {top}", "--define", f"_tmppath {work}/tmp",
+             "--buildroot", str(work / "buildroot"), str(sp)], env={**os.environ, "HOME": str(work)})
+        out = list(top.glob("RPMS/*/*.rpm"))
+        if len(out) != 1:
+            raise SyncError(f"rpmbuild produced {len(out)} rpms")
+        return out[0]
+
+    def sign(self, rpm):
+        env = {**os.environ, "GNUPGHOME": str(self.gnupg)}
+        run(["rpmsign", "--define", f"_gpg_name {SIGN_UID}", "--define", f"_gpg_path {self.gnupg}",
+             "--addsign", str(rpm)], env=env)
+
+    def prune(self):
+        """Keep the newest N rpms so storage stays bounded."""
+        rpms = sorted(self.repo.glob("*.rpm"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in rpms[self.r.keep:]:
+            log.info("%s: pruning %s", self.r.name, old.name)
+            old.unlink()
+
+
+def ensure_signing_key(state):
+    gh = Path(state) / "gnupg"
+    pub = Path(state) / KEY_NAME
+    gh.mkdir(mode=0o700, exist_ok=True)
+    env = {**os.environ, "GNUPGHOME": str(gh)}
+    have = run(["gpg", "--batch", "--list-secret-keys", SIGN_UID], env=env, check=False).returncode == 0
+    if not have:
+        log.info("generating local RPM signing key")
+        run(["gpg", "--batch", "--passphrase", "", "--quick-generate-key", SIGN_UID, "rsa3072", "sign", "never"],
+            env=env)
+    exp = run(["gpg", "--batch", "--armor", "--export", SIGN_UID], env=env).stdout
+    if not pub.exists() or pub.read_text() != exp:
+        pub.write_text(exp)
+        pub.chmod(0o644)
+
+
+# ---------------------------------------------------------------- server
+
+class App:
+    def __init__(self, syncers, state, idle):
+        self.syncers = syncers
+        self.state = Path(state)
+        self.idle = idle
+        self.last = time.monotonic()
+        self.active = 0
+        self.mu = threading.Lock()
+
+
+def make_handler(app):
+    class H(BaseHTTPRequestHandler):
+        server_version = "repackd"
+
+        def log_message(self, fmt, *a):
+            log.info("%s %s", self.address_string(), fmt % a)
+
+        def do_HEAD(self):
+            self.serve(head=True)
+
+        def do_GET(self):
+            self.serve(head=False)
+
+        def serve(self, head):
+            with app.mu:
+                app.active += 1
+            try:
+                self._serve(head)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with app.mu:
+                    app.active -= 1
+                    app.last = time.monotonic()
+
+        def _serve(self, head):
+            path = self.path.split("?", 1)[0].lstrip("/")
+            if path == "healthz":
+                return self.send_bytes(b"ok\n", head)
+            if path == KEY_NAME:
+                return self.send_file(app.state / KEY_NAME, head)
+            name, _, rest = path.partition("/")
+            sy = app.syncers.get(name)
+            if not sy or not rest:
+                return self.send_error(404)
+            if rest == "repodata/repomd.xml":
+                sy.refresh()
+            base = sy.repo.resolve()
+            target = (base / rest).resolve()
+            if not target.is_relative_to(base) or not target.is_file():
+                return self.send_error(404)
+            self.send_file(target, head)
+
+        def send_bytes(self, data, head):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(data)
+
+        def send_file(self, p, head):
+            try:
+                f = open(p, "rb")
+            except OSError:
+                return self.send_error(404)
+            with f:
+                size = os.fstat(f.fileno()).st_size
+                start, end, code = 0, size - 1, 200
+                m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+                if m and (m[1] or m[2]):
+                    if m[1]:
+                        start = int(m[1])
+                        end = int(m[2]) if m[2] else size - 1
+                    else:
+                        start = max(0, size - int(m[2]))
+                    end = min(end, size - 1)
+                    if start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    code = 206
+                self.send_response(code)
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                if code == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                if head:
+                    return
+                f.seek(start)
+                left = end - start + 1
+                while left > 0 and (chunk := f.read(min(1 << 20, left))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+    return H
+
+
+def serve(app, listen):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app), bind_and_activate=False)
+    srv.daemon_threads = True
+    fds = int(os.environ.get("LISTEN_FDS", "0"))
+    if fds and os.environ.get("LISTEN_PID") == str(os.getpid()):
+        srv.socket.close()
+        srv.socket = socket.socket(fileno=3)
+        log.info("using socket-activated fd 3")
+    else:
+        host, _, port = listen.rpartition(":")
+        srv.server_address = (host or "127.0.0.1", int(port))
+        srv.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.server_bind()
+        srv.server_activate()
+        log.info("listening on %s", listen)
+
+    def watchdog():
+        while True:
+            time.sleep(2)
+            with app.mu:
+                idle = time.monotonic() - app.last
+                busy = app.active
+            if app.idle and not busy and idle > app.idle:
+                log.info("idle %ds, exiting", app.idle)
+                srv.shutdown()
+                return
+    threading.Thread(target=watchdog, daemon=True).start()
+    srv.serve_forever(poll_interval=1)
+
+
+# ---------------------------------------------------------------- main
+
+def load(args):
+    syncers = {}
+    for p in sorted(Path(args.recipes).glob("*.toml")):
+        r = Recipe(p, args.keys)
+        syncers[r.name] = Syncer(r, args.state, args.check_minutes)
+    return syncers
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="repackd")
+    env = os.environ.get
+    ap.add_argument("--state", default=env("STATE_DIRECTORY", "/var/lib/repackd").split(":")[0])
+    ap.add_argument("--recipes", default=env("REPACKD_RECIPES", "/etc/repackd/recipes"))
+    ap.add_argument("--keys", default=env("REPACKD_KEYS", "/etc/repackd/keys"))
+    ap.add_argument("--check-minutes", type=float, default=float(env("REPACKD_CHECK_MINUTES", "30")))
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("serve")
+    s.add_argument("--listen", default="127.0.0.1:8742")
+    s.add_argument("--idle", type=int, default=int(env("REPACKD_IDLE_SECONDS", "60")))
+    sub.add_parser("sync").add_argument("recipe", nargs="?")
+    sub.add_parser("approve").add_argument("recipe")
+    args = ap.parse_args(sys.argv[1:] or ["serve"])
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    Path(args.state).mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_signing_key(args.state)
+        syncers = load(args)
+    except (SyncError, ValueError, KeyError, OSError) as e:
+        log.error("startup: %s", e)
+        return 1
+    if args.cmd == "sync":
+        for n, sy in syncers.items():
+            if args.recipe in (None, n):
+                sy.refresh(force=True)
+        return 0
+    if args.cmd == "approve":
+        sy = syncers[args.recipe]
+        st = sy.state()
+        if "blocked_version" not in st:
+            print("nothing blocked")
+            return 0
+        st["approved_version"] = st["blocked_version"]
+        sy.save_state(st)
+        print(f"approved {st['approved_version']}; next sync will build it")
+        return 0
+    app = App(syncers, args.state, getattr(args, "idle", 60))
+    serve(app, getattr(args, "listen", "127.0.0.1:8742"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
