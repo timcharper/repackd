@@ -12,9 +12,9 @@ package   = "claude-desktop"
 key_url   = "https://downloads.claude.ai/claude-desktop/key.asc"
 # Dearmored copy lives in /etc/repackd/keys (install.sh puts it there).
 keyring   = "claude-desktop.gpg"
-# Optional: fill in a fingerprint you verified out-of-band; install.sh then
-# refuses a key that doesn't match instead of trusting on first use.
-key_fingerprint = ""
+# install.sh refuses a key that doesn't match this (published in Anthropic's docs).
+# Leave empty to trust on first use instead.
+key_fingerprint = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"  # per code.claude.com/docs/en/desktop-linux
 
 [build]
 # Debian/Ubuntu-only files that mean nothing on Fedora.
@@ -22,8 +22,9 @@ strip        = ["etc/apt", "etc/apparmor.d", "usr/share/keyrings"]
 setuid       = ["usr/lib/claude-desktop/chrome-sandbox"]
 # Bundled Electron libs: not exported as Provides, not required from the system.
 bundled_dir  = "usr/lib/claude-desktop"
-# Cowork (agent VM) wants KVM/QEMU; deb lists it as Recommends.
-recommends   = ["qemu-kvm"]
+# Cowork (agent VM): QEMU + UEFI + virtiofsd (x86_64 names; arm64 needs qemu-system-aarch64-core, edk2-aarch64).
+# You also need to be in the kvm group (sudo usermod -aG kvm $USER).
+recommends   = ["qemu-system-x86-core", "edk2-ovmf", "virtiofsd"]
 # Extra regex alternatives for __requires_exclude, if autoreq misfires.
 exclude_requires = []
 # warn: log + save a diff when postinst/preinst/prerm/postrm change. block: refuse the update.
