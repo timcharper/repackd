@@ -1,0 +1,28 @@
+# Vanta agent: no apt repo and no signatures, so trust is TLS to vanta.com only.
+# The endpoint redirects to the current .deb; a redirect we have already built is "no update".
+name    = "vanta"
+summary = "Vanta agent (local repack of the vendor .deb)"
+license = "Proprietary"
+url     = "https://www.vanta.com"
+
+[direct]
+url = "https://app.vanta.com/osquery/download/linux"
+# Must match the deb control Package (defaults to the recipe name).
+package = "vanta"
+
+[build]
+# Sysvinit/upstart files from the deb; systemd only here.
+strip        = ["etc/init.d", "etc/init"]
+bundled_dir  = "var/vanta"
+requires     = ["systemd"]
+# semanage, for the bin_t label on /var/vanta
+recommends   = ["policycoreutils-python-utils"]
+exclude_requires = []
+control_change = "warn"
+keep = 3
+# Replaces the deb maintainer scripts (still hash-tracked); lives next to this file.
+scriptlets = "vanta.scriptlets.spec"
+
+# The agent config holds the agent key, so it is root-only.
+[build.modes]
+"etc/vanta.conf" = "0600"

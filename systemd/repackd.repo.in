@@ -1,6 +1,6 @@
-[repackd-@NAME@]
-name=@SUMMARY@
-baseurl=http://127.0.0.1:@PORT@/@NAME@/
+[repackd]
+name=Repackd
+baseurl=http://127.0.0.1:@PORT@/repo/
 enabled=1
 gpgcheck=1
 gpgkey=file:///var/lib/repackd/RPM-GPG-KEY-repackd

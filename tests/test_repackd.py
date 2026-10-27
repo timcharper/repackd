@@ -169,7 +169,8 @@ class TestSync(Base):
         self.assertIn("published", p.stderr, p.stderr)
         self.assertEqual(len(self.rpms()), 1)
         rpm = self.rpms()[0]
-        self.assertTrue((self.state / "fake/repo/repodata/repomd.xml").is_file())
+        self.assertTrue((self.state / "repo/repodata/repomd.xml").is_file())
+        self.assertEqual([x.name for x in (self.state / "repo").glob("*.rpm")], [rpm.name])
 
         # requires contain no bundled soname; provides don't export it
         req = sh("rpm", "-qp", "--requires", str(rpm)).stdout
@@ -245,6 +246,9 @@ class TestSync(Base):
             a.publish(f"2:1.100.{i}-1", postinst="#!/bin/sh\necho changed again\n")
             self.repackd("sync")
         self.assertEqual(len(self.rpms()), 3)
+        self.repackd("sync")
+        self.assertEqual(sorted(x.name for x in (self.state / "repo").glob("*.rpm")), sorted(x.name for x in self.rpms()))
+        self.assertIn(b"1.100.9", sh("zstd", "-dc", str(next((self.state / "repo/repodata").glob("*primary.xml.zst"))), text=False).stdout)
         md = sh("createrepo_c", "--help").returncode  # sanity that tool exists
         self.assertEqual(md, 0)
         self.assertLessEqual(len(list((self.state / "fake/diffs").glob("*.diff"))), 5)
@@ -265,17 +269,229 @@ class TestSync(Base):
                     break
                 except OSError:
                     time.sleep(0.1)
-            r = urllib.request.urlopen(f"http://127.0.0.1:{port}/fake/repodata/repomd.xml", timeout=60)
+            r = urllib.request.urlopen(f"http://127.0.0.1:{port}/repo/repodata/repomd.xml", timeout=60)
             self.assertEqual(r.status, 200)
             self.assertIn(b"<repomd", r.read())
             # traversal and unknown paths
-            for bad in ("/fake/../state.json", "/fake/%2e%2e/fake/state.json", "/nope/x"):
+            for bad in ("/repo/../state.json", "/repo/%2e%2e/fake/state.json", "/fake/repodata/repomd.xml", "/nope/x"):
                 with self.assertRaises(urllib.error.HTTPError):
                     urllib.request.urlopen(f"http://127.0.0.1:{port}{bad}", timeout=5)
         finally:
             srv.terminate()
             err = srv.communicate()[1]
         self.assertIn("serving existing repo", err)
+
+
+class RedirectHandler(SimpleHTTPRequestHandler):
+    """/latest redirects to the .deb the test last pointed it at."""
+    target = None
+    hits = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_HEAD(self):
+        if self.path == "/latest":
+            type(self).hits.append("HEAD")
+            if type(self).target is None:
+                return self.send_error(503)
+            self.send_response(302)
+            self.send_header("Location", type(self).target)
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        super().do_HEAD()
+
+    def do_GET(self):
+        if self.path.startswith("/pool/"):
+            type(self).hits.append("GET")
+        super().do_GET()
+
+
+class TestDirect(unittest.TestCase):
+    """[direct] source: no signed index; a redirect already built is no update."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="rd"))
+        cls.apt = FakeApt(cls.tmp / "apt")  # only used to make debs; its index is ignored
+        cls.apt.server.shutdown()
+        cls.apt.server.server_close()
+        RedirectHandler.hits = []
+        cls.srv = HTTPServer(("127.0.0.1", 0), partial(RedirectHandler, directory=str(cls.apt.web)))
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.recipes = cls.tmp / "recipes"
+        cls.recipes.mkdir()
+        cls.state = cls.tmp / "state"
+        (cls.recipes / "fake.scriptlets.spec").write_text(
+            "%post\necho scriptlet-ran\n\n%postun\nif [ \"$1\" -eq 0 ]; then rm -f /nonexistent-repackd-test; fi\n")
+        (cls.recipes / "fake.toml").write_text(f"""
+name = "fake"
+summary = "Fake direct"
+[direct]
+url = "http://127.0.0.1:{cls.port}/latest"
+package = "fakeapp"
+[build]
+strip = ["etc/apt"]
+bundled_dir = "usr/lib/fakeapp"
+scriptlets = "fake.scriptlets.spec"
+[build.modes]
+"usr/share/applications/fakeapp.desktop" = "0600"
+""")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def point_at(self, version):
+        self.apt.publish(version)
+        RedirectHandler.target = f"http://127.0.0.1:{self.port}/pool/fakeapp_{version}_{self.apt.arch}.deb"
+
+    def repackd(self, *args):
+        e = {**os.environ, "GNUPGHOME": str(self.state / "gnupg")}
+        return sh(sys_python(), "-I", str(REPACKD), "--state", str(self.state), "--recipes", str(self.recipes),
+                  "--keys", str(self.tmp / "keys"), *args, env=e, check=False)
+
+    def rpms(self):
+        return sorted((self.state / "fake/repo").glob("*.rpm"))
+
+    def test_flow(self):
+        # upstream down at first: nothing built, clean failure
+        RedirectHandler.target = None
+        p = self.repackd("sync")
+        self.assertIn("sync failed", p.stderr)
+        self.assertEqual(self.rpms(), [])
+
+        # first build: version comes from the deb's control file
+        self.point_at("3.1.0")
+        p = self.repackd("sync")
+        self.assertIn("published", p.stderr, p.stderr)
+        rpm = self.rpms()[0]
+        self.assertEqual(sh("rpm", "-qp", "--qf", "%{VERSION}-%{RELEASE}", str(rpm)).stdout, "3.1.0-1.repackd")
+        st = __import__("json").loads((self.state / "fake/state.json").read_text())
+        self.assertEqual(len(st["built_sha256"]), 64)
+        self.assertTrue(st["built_url"].endswith("fakeapp_3.1.0_%s.deb" % self.apt.arch))
+
+        # scriptlets from the recipe are in the rpm; vendor maintainer scripts are not converted
+        scripts = sh("rpm", "-qp", "--scripts", str(rpm)).stdout
+        self.assertIn("scriptlet-ran", scripts)
+        self.assertIn("postuninstall", scripts)
+        # mode override applies
+        lv = sh("rpm", "-qplv", str(rpm)).stdout
+        desktop = [l for l in lv.splitlines() if l.endswith("fakeapp.desktop")][0]
+        self.assertTrue(desktop.split()[0].startswith("-rw-------"), desktop)
+
+        # same redirect: HEAD only, no download, rpm untouched
+        mt = rpm.stat().st_mtime_ns
+        RedirectHandler.hits.clear()
+        p = self.repackd("sync")
+        self.assertIn("up to date (redirect unchanged)", p.stderr)
+        self.assertEqual(RedirectHandler.hits, ["HEAD"])
+        self.assertEqual(rpm.stat().st_mtime_ns, mt)
+
+        # new redirect target builds the new version
+        self.point_at("3.2.0")
+        p = self.repackd("sync")
+        self.assertIn("published", p.stderr, p.stderr)
+        self.assertEqual(len(self.rpms()), 2)
+
+        # a broken build does not record the URL, so it is retried
+        self.apt.publish("3.3.0")
+        (self.apt.web / "pool" / f"fakeapp_3.3.0_{self.apt.arch}.deb").write_bytes(b"not a deb")
+        RedirectHandler.target = f"http://127.0.0.1:{self.port}/pool/fakeapp_3.3.0_{self.apt.arch}.deb"
+        p = self.repackd("sync")
+        self.assertIn("sync failed", p.stderr)
+        self.assertEqual(len(self.rpms()), 2)
+        RedirectHandler.hits.clear()
+        self.repackd("sync")
+        self.assertEqual(RedirectHandler.hits, ["HEAD", "GET"])
+
+        # a different package behind the redirect is refused
+        self.apt.publish("3.4.0")
+        RedirectHandler.target = f"http://127.0.0.1:{self.port}/pool/fakeapp_3.4.0_{self.apt.arch}.deb"
+        cfg = (self.recipes / "fake.toml").read_text()
+        (self.recipes / "fake.toml").write_text(cfg.replace('package = "fakeapp"', 'package = "other"'))
+        p = self.repackd("sync")
+        self.assertIn("recipe expects 'other'", p.stderr)
+        (self.recipes / "fake.toml").write_text(cfg)
+
+        # no redirect at all (a 200) is an error, not a build
+        RedirectHandler.target = None
+        self.assertIn("sync failed", self.repackd("sync").stderr)
+
+    def test_recipe_needs_one_source(self):
+        bad = self.tmp / "bad"
+        bad.mkdir()
+        (bad / "x.toml").write_text('name = "x"\n[direct]\nurl = "http://x"\n[apt]\nurl="u"\npackage="p"\nkeyring="k"\n')
+        p = sh(sys_python(), "-I", str(REPACKD), "--state", str(self.tmp / "s2"), "--recipes", str(bad),
+               "--keys", str(self.tmp), "sync", check=False)
+        self.assertIn("exactly one", p.stderr)
+
+
+class TestVantaScriptlet(unittest.TestCase):
+    """Run the %post of recipes/vanta.scriptlets.spec against a sandbox with stubbed system tools."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vs"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        text = (ROOT / "recipes/vanta.scriptlets.spec").read_text()
+        post = text.split("%post\n", 1)[1].split("\n%preun", 1)[0].replace("%%", "%")
+        self.conf, self.envf = self.tmp / "vanta.conf", self.tmp / "vanta.env"
+        post = post.replace("/etc/repackd/vanta.env", str(self.envf)).replace("/etc/vanta.conf", str(self.conf))
+        self.script = self.tmp / "post.sh"
+        self.script.write_text(post)
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        for tool in ("systemctl", "semanage", "restorecon", "chown"):
+            (bin_ / tool).write_text(f"#!/bin/sh\necho {tool} \"$@\" >>{self.tmp}/calls\n")
+            (bin_ / tool).chmod(0o755)
+        # pretend every file is root-owned so the permission check can pass without root
+        (bin_ / "stat").write_text('#!/bin/sh\necho "0 $(/usr/bin/stat -c %a "$3")"\n')
+        (bin_ / "stat").chmod(0o755)
+        self.bin = bin_
+
+    def post(self, arg="1", env=None):
+        e = {"PATH": f"{self.bin}:/usr/bin:/bin", **(env or {})}
+        return sh("sh", str(self.script), arg, env=e, check=False)
+
+    def write_env(self, text, mode=0o600):
+        self.envf.write_text(text)
+        os.chmod(self.envf, mode)
+
+    def test_env_file_registers_on_fresh_install(self):
+        self.write_env('# c\nVANTA_KEY="k1=="\nVANTA_OWNER_EMAIL=a@b.c\nVANTA_REGION=us\nVANTA_FOO=x\n')
+        self.assertEqual(self.post().returncode, 0)
+        d = __import__("json").loads(self.conf.read_text())
+        self.assertEqual((d["AGENT_KEY"], d["OWNER_EMAIL"], d["REGION"]), ("k1==", "a@b.c", "us"))
+        self.assertEqual(oct(self.conf.stat().st_mode & 0o777), "0o600")
+
+    def test_loose_env_file_ignored(self):
+        self.write_env("VANTA_KEY=k\nVANTA_OWNER_EMAIL=a@b.c\n", mode=0o644)
+        p = self.post()
+        self.assertIn("ignoring", p.stderr)
+        self.assertNotIn("AGENT_KEY", self.conf.read_text() if self.conf.exists() else "")
+
+    def test_environment_wins_and_upgrade_ignores_file(self):
+        self.write_env("VANTA_KEY=fromfile\nVANTA_OWNER_EMAIL=file@x.y\n")
+        self.post(env={"VANTA_KEY": "envkey", "VANTA_OWNER_EMAIL": "env@x.y", "VANTA_REGION": "eu"})
+        d = __import__("json").loads(self.conf.read_text())
+        self.assertEqual((d["AGENT_KEY"], d["OWNER_EMAIL"]), ("envkey", "env@x.y"))
+        self.conf.write_text("{}")
+        self.post(arg="2")  # upgrade: no registration, config untouched
+        self.assertEqual(self.conf.read_text(), "{}")
+
+    def test_bad_input_refused(self):
+        p = self.post(env={"VANTA_KEY": "k"})
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("VANTA_OWNER_EMAIL", p.stderr)
+        p = self.post(env={"VANTA_KEY": 'a"b', "VANTA_OWNER_EMAIL": "e@x.y"})
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not allowed", p.stderr)
+        p = self.post()  # nothing set: installs unregistered, prints how to register
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("vanta-cli register", p.stdout)
 
 
 if __name__ == "__main__":

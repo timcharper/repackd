@@ -23,6 +23,8 @@ import tempfile
 import threading
 import time
 import tomllib
+import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +36,7 @@ SCRIPTS = ("preinst", "postinst", "prerm", "postrm")
 MAX_INDEX = 256 << 20
 MAX_DEB = 4 << 30
 KEY_NAME = "RPM-GPG-KEY-repackd"
+REPO_NAME = "repo"  # URL path of the one repo dnf sees; not usable as a recipe name
 SIGN_UID = "repackd local signing key <repackd@localhost>"
 
 SPEC = """\
@@ -71,6 +74,7 @@ cp -a @TREE@/. %{buildroot}/
 %files
 %defattr(-,root,root,-)
 @FILES@
+@SCRIPTLETS@
 """
 
 
@@ -110,6 +114,34 @@ def fetch(url, dest, limit, want_sha=None, want_size=None):
         raise SyncError(f"{url}: size {n} != signed size {want_size}")
     if want_sha and h.hexdigest() != want_sha.lower():
         raise SyncError(f"{url}: sha256 {h.hexdigest()} != signed {want_sha}")
+    return h.hexdigest()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+def resolve_redirect(url):
+    """HEAD url without following redirects; return its single-hop Location.
+
+    A downgrade from https to http is refused. The target is not fetched.
+    """
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "repackd"})
+    try:
+        urllib.request.build_opener(_NoRedirect).open(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        if e.code not in (301, 302, 303, 307, 308) or not loc:
+            raise SyncError(f"{url}: HTTP {e.code}")
+        target = urllib.parse.urljoin(url, loc)
+    except OSError as e:
+        raise SyncError(f"resolve {url}: {e}")
+    else:
+        raise SyncError(f"{url}: expected a redirect to the package")
+    if url.startswith("https:") and not target.startswith("https:"):
+        raise SyncError(f"{url}: redirect to non-https {target}")
+    return target
 
 
 def deb_ver_cmp(a, b):
@@ -262,17 +294,25 @@ class Recipe:
     def __init__(self, path, keys_dir):
         d = tomllib.loads(Path(path).read_text())
         self.name = d["name"]
-        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.name):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.name) or self.name == REPO_NAME:
             raise ValueError(f"{path}: bad recipe name {self.name!r}")
         self.summary = d.get("summary", self.name)
         self.license = d.get("license", "Proprietary")
         self.url = d.get("url", "")
-        apt = d["apt"]
-        self.apt_url = apt["url"].rstrip("/")
-        self.suite = apt.get("suite", "stable")
-        self.component = apt.get("component", "main")
-        self.package = apt["package"]
-        self.keyring = Path(keys_dir) / apt["keyring"]
+        if ("apt" in d) == ("direct" in d):
+            raise ValueError(f"{path}: need exactly one of [apt] or [direct]")
+        self.apt_url = self.direct_url = None
+        if "apt" in d:
+            apt = d["apt"]
+            self.apt_url = apt["url"].rstrip("/")
+            self.suite = apt.get("suite", "stable")
+            self.component = apt.get("component", "main")
+            self.package = apt["package"]
+            self.keyring = Path(keys_dir) / apt["keyring"]
+        else:
+            # An https URL that redirects (once) to the .deb. Trust is TLS only.
+            self.direct_url = d["direct"]["url"]
+            self.package = d["direct"].get("package", self.name)
         b = d.get("build", {})
         self.strip = [s.strip("/") for s in b.get("strip", [])]
         self.setuid = [s.strip("/") for s in b.get("setuid", [])]
@@ -286,6 +326,16 @@ class Recipe:
         if self.control_change not in ("warn", "block"):
             raise ValueError("control_change must be warn or block")
         self.keep = int(b.get("keep", 3))
+        self.modes = {k.strip("/"): v for k, v in b.get("modes", {}).items()}
+        for k, v in self.modes.items():
+            if not re.fullmatch(r"[0-7]{4}", v):
+                raise ValueError(f"{path}: bad mode {v!r} for {k}")
+        self.scriptlets = ""
+        if b.get("scriptlets"):
+            sf = Path(b["scriptlets"])
+            if sf.name != b["scriptlets"]:
+                raise ValueError(f"{path}: scriptlets must be a file next to the recipe")
+            self.scriptlets = (Path(path).parent / sf).read_text()
 
 
 # ---------------------------------------------------------------- syncer
@@ -309,6 +359,7 @@ class Syncer:
 
     def cleanup_stale(self):
         shutil.rmtree(self.root / "work", ignore_errors=True)
+        shutil.rmtree(self.repo / "repodata", ignore_errors=True)  # per-recipe metadata of older versions
 
     def state(self):
         try:
@@ -347,34 +398,76 @@ class Syncer:
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True)
         try:
-            ent = self.latest_entry(work)
             st = self.state()
-            ver = ent["Version"]
-            if st.get("built_version") == ver and any(self.repo.glob("*.rpm")):
-                log.info("%s: %s up to date", r.name, ver)
-                return
-            if st.get("blocked_version") == ver and st.get("approved_version") != ver:
-                log.warning("%s: %s blocked by maintainer-script change; run `repackd approve %s`",
-                            r.name, ver, r.name)
-                return
-            log.info("%s: building %s (was %s)", r.name, ver, st.get("built_version"))
             deb = work / "pkg.deb"
-            fetch(f"{r.apt_url}/{ent['Filename']}", deb, MAX_DEB, ent["SHA256"], int(ent["Size"]))
+            built = {}
+            if r.direct_url:
+                # No signed index: the redirect target is the only change signal.
+                # A target we already built (or have blocked) is not fetched again.
+                src = resolve_redirect(r.direct_url)
+                if src == st.get("built_url") and any(self.repo.glob("*.rpm")):
+                    log.info("%s: %s up to date (redirect unchanged)", r.name, st.get("built_version"))
+                    return
+                if src == st.get("blocked_url") and st.get("approved_version") != st.get("blocked_version"):
+                    log.warning("%s: %s blocked by maintainer-script change; run `repackd approve %s`",
+                                r.name, st.get("blocked_version"), r.name)
+                    return
+                log.info("%s: new upstream %s (was %s)", r.name, src, st.get("built_url"))
+                built = {"built_url": src, "built_sha256": fetch(src, deb, MAX_DEB)}
+                ver = None
+            else:
+                ent = self.latest_entry(work)
+                ver = ent["Version"]
+                if st.get("built_version") == ver and any(self.repo.glob("*.rpm")):
+                    log.info("%s: %s up to date", r.name, ver)
+                    return
+                if st.get("blocked_version") == ver and st.get("approved_version") != ver:
+                    log.warning("%s: %s blocked by maintainer-script change; run `repackd approve %s`",
+                                r.name, ver, r.name)
+                    return
+                log.info("%s: building %s (was %s)", r.name, ver, st.get("built_version"))
+                built = {"built_sha256": fetch(f"{r.apt_url}/{ent['Filename']}", deb, MAX_DEB,
+                                               ent["SHA256"], int(ent["Size"]))}
             tree, ctl = work / "tree", work / "control"
             self.unpack(deb, tree, ctl)
-            self.guard_control(ctl, ver, st)  # may raise to block
+            if ver is None:
+                ver = self.control_version(ctl)
+                log.info("%s: building %s (was %s)", r.name, ver, st.get("built_version"))
+            try:
+                self.guard_control(ctl, ver, st)  # may raise to block
+            except SyncError:
+                if r.direct_url:
+                    st = self.state()
+                    st["blocked_url"] = built["built_url"]
+                    self.save_state(st)
+                raise
             rpm = self.build_rpm(work, tree, ver)
             self.sign(rpm)
             shutil.copy(rpm, self.repo / rpm.name)  # fresh mtime orders pruning
             self.prune()
-            run(["createrepo_c", "--update", "--no-database", "--retain-old-md", "0", str(self.repo)])
             st = self.state()
-            st.update(built_version=ver)
+            st.update(built_version=ver, **built)
             st.pop("blocked_version", None)
+            st.pop("blocked_url", None)
             self.save_state(st)
             log.info("%s: published %s", r.name, rpm.name)
         finally:
             shutil.rmtree(work, ignore_errors=True)
+
+    def control_version(self, ctl):
+        """Version of a deb fetched without a signed index, from its own control file."""
+        try:
+            ent = next(parse_stanzas((ctl / "control").read_text()))
+        except (OSError, StopIteration):
+            raise SyncError("deb has no usable control file")
+        for k in ("Package", "Version"):
+            if not ent.get(k):
+                raise SyncError(f"deb control lacks {k}")
+        if ent["Package"] != self.r.package:
+            raise SyncError(f"deb is package {ent['Package']!r}, recipe expects {self.r.package!r}")
+        if ent.get("Architecture") not in (ARCH_MAP[self.arch], "all"):
+            raise SyncError(f"deb architecture {ent.get('Architecture')!r} does not fit {self.arch}")
+        return ent["Version"]
 
     def verify_release(self, work):
         r = self.r
@@ -536,12 +629,13 @@ class Syncer:
                         lines.append("%dir " + spec_path("/" + rp))
                     continue
                 path = spec_path("/" + rp)
+                attr = f"%attr({r.modes[rp]},root,root) " if rp in r.modes else ""
                 if rp in setuid:
                     lines.append(f"%attr(4755,root,root) {path}")
                 elif rp.startswith("etc/"):
-                    lines.append(f"%config(noreplace) {path}")
+                    lines.append(f"{attr}%config(noreplace) {path}")
                 else:
-                    lines.append(path)
+                    lines.append(attr + path)
         deps = [f"Requires:       {x}" for x in r.requires]
         deps += [f"Recommends:     {x}" for x in r.recommends]
         deps += [f"Suggests:       {x}" for x in r.suggests]
@@ -551,6 +645,7 @@ class Syncer:
             "@EPOCH@": f"Epoch:          {epoch}\n" if epoch else "", "@VERSION@": rpmver,
             "@RELEASE@": rel, "@SUMMARY@": r.summary, "@LICENSE@": r.license, "@URL@": r.url or "https://localhost/",
             "@DEPS@": "\n".join(deps), "@TREE@": str(tree), "@FILES@": "\n".join(lines),
+            "@SCRIPTLETS@": r.scriptlets,  # last: its text is never re-substituted
         }.items():
             spec = spec.replace(k, v)
         top = work / "rpmbuild"
@@ -576,6 +671,50 @@ class Syncer:
             old.unlink()
 
 
+class Union:
+    """The one repo dnf sees: every enabled recipe's RPMs, hardlinked, with one set of metadata."""
+
+    def __init__(self, syncers, state):
+        self.syncers = syncers
+        self.dir = Path(state) / REPO_NAME
+        self.lock = threading.Lock()
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def refresh(self, force=False):
+        """Sync every recipe in parallel (each keeps its own repo on failure), then republish."""
+        threads = [threading.Thread(target=sy.refresh, args=(force,)) for sy in self.syncers.values()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        try:
+            self.rebuild()
+        except SyncError as e:
+            log.error("repo metadata: %s", e)
+
+    def rebuild(self):
+        with self.lock:
+            want = {p.name: p for sy in self.syncers.values() for p in sy.repo.glob("*.rpm")}
+            have = {p.name: p for p in self.dir.glob("*.rpm")}
+            changed = False
+            for n, p in have.items():
+                if n not in want:
+                    p.unlink()
+                    changed = True
+            for n, src in want.items():
+                dst = self.dir / n
+                if n in have and os.path.samefile(src, dst):
+                    continue
+                dst.unlink(missing_ok=True)
+                try:
+                    os.link(src, dst)
+                except OSError:  # different filesystem
+                    shutil.copy2(src, dst)
+                changed = True
+            if changed or not (self.dir / "repodata/repomd.xml").is_file():
+                run(["createrepo_c", "--update", "--no-database", "--retain-old-md", "0", str(self.dir)])
+
+
 def ensure_signing_key(state):
     gh = Path(state) / "gnupg"
     pub = Path(state) / KEY_NAME
@@ -595,8 +734,8 @@ def ensure_signing_key(state):
 # ---------------------------------------------------------------- server
 
 class App:
-    def __init__(self, syncers, state, idle):
-        self.syncers = syncers
+    def __init__(self, union, state, idle):
+        self.union = union
         self.state = Path(state)
         self.idle = idle
         self.last = time.monotonic()
@@ -636,12 +775,11 @@ def make_handler(app):
             if path == KEY_NAME:
                 return self.send_file(app.state / KEY_NAME, head)
             name, _, rest = path.partition("/")
-            sy = app.syncers.get(name)
-            if not sy or not rest:
+            if name != REPO_NAME or not rest:
                 return self.send_error(404)
             if rest == "repodata/repomd.xml":
-                sy.refresh()
-            base = sy.repo.resolve()
+                app.union.refresh()
+            base = app.union.dir.resolve()
             target = (base / rest).resolve()
             if not target.is_relative_to(base) or not target.is_file():
                 return self.send_error(404)
@@ -754,10 +892,16 @@ def main():
     except (SyncError, ValueError, KeyError, OSError) as e:
         log.error("startup: %s", e)
         return 1
+    union = Union(syncers, args.state)
     if args.cmd == "sync":
         for n, sy in syncers.items():
             if args.recipe in (None, n):
                 sy.refresh(force=True)
+        try:
+            union.rebuild()
+        except SyncError as e:
+            log.error("repo metadata: %s", e)
+            return 1
         return 0
     if args.cmd == "approve":
         sy = syncers[args.recipe]
@@ -769,7 +913,7 @@ def main():
         sy.save_state(st)
         print(f"approved {st['approved_version']}; next sync will build it")
         return 0
-    app = App(syncers, args.state, getattr(args, "idle", 60))
+    app = App(union, args.state, getattr(args, "idle", 60))
     serve(app, getattr(args, "listen", "127.0.0.1:8742"))
     return 0
 
